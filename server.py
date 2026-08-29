@@ -37,6 +37,7 @@ import pymysql
 import pymysql.cursors
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -121,6 +122,12 @@ mcp = FastMCP(
         "rejected by this server."
     ),
     stateless_http=True,
+    # The MCP SDK's DNS-rebinding protection only trusts "localhost" by
+    # default and returns 421 for any other Host header -- which rejects
+    # every real deployment (Render, Fly.io, etc.) out of the box. Our
+    # bearer-token middleware below is the real access control, so it's
+    # safe to disable this check rather than hardcode a specific hostname.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
