@@ -138,7 +138,10 @@ def list_tables() -> list[str]:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES")
         rows = cur.fetchall()
+    print(f">>> RAW TABLE ROWS: {rows}", flush=True)
     # SHOW TABLES returns one column named Tables_in_<dbname>
+    print(f">>> RAW ROWS: {rows}", flush=True)
+    print(f">>> ROW COUNT: {len(rows)}", flush=True)
     return [next(iter(row.values())) for row in rows]
 
 
