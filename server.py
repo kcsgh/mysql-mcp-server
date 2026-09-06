@@ -132,7 +132,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def list_tables() -> list[str]:
+def list_tables() -> dict:
     """List every table in the connected database."""
     print(">>> TOOL CALLED: list_tables", flush=True)
     with get_connection() as conn, conn.cursor() as cur:
