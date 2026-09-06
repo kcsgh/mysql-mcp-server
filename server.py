@@ -175,7 +175,7 @@ def run_query(sql: str, row_limit: int = DEFAULT_ROW_LIMIT) -> dict:
     added automatically if your query doesn't already have one, capped
     at MAX_ROW_LIMIT rows.
     """
-    print(f">>> TOOL CALLED: run_query | SQL: {query}", flush=True)
+    print(f">>> TOOL CALLED: run_query | SQL: {sql}", flush=True)
     safe_sql = validate_select(sql)
     limit = max(1, min(row_limit, MAX_ROW_LIMIT))
 
