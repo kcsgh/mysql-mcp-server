@@ -142,7 +142,15 @@ def list_tables() -> list[str]:
     # SHOW TABLES returns one column named Tables_in_<dbname>
     print(f">>> RAW ROWS: {rows}", flush=True)
     print(f">>> ROW COUNT: {len(rows)}", flush=True)
-    return [next(iter(row.values())) for row in rows]
+    tables = [next(iter(row.values())) for row in rows]
+
+    print(f">>> RETURNING TABLES: {tables}", flush=True)
+
+    return {
+        "database": os.getenv("MYSQL_DATABASE"),
+        "table_count": len(tables),
+        "tables": tables
+           }
 
 
 @mcp.tool()
