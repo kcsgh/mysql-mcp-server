@@ -134,6 +134,7 @@ mcp = FastMCP(
 @mcp.tool()
 def list_tables() -> list[str]:
     """List every table in the connected database."""
+    print(">>> TOOL CALLED: list_tables", flush=True)
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES")
         rows = cur.fetchall()
@@ -144,6 +145,7 @@ def list_tables() -> list[str]:
 @mcp.tool()
 def describe_table(table_name: str) -> list[dict]:
     """Show the columns, types, keys, and nullability for one table."""
+    print(f">>> TOOL CALLED: describe_table | table={table_name}", flush=True)
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SHOW TABLES")
         valid_tables = {next(iter(row.values())) for row in cur.fetchall()}
@@ -162,6 +164,7 @@ def run_query(sql: str, row_limit: int = DEFAULT_ROW_LIMIT) -> dict:
     added automatically if your query doesn't already have one, capped
     at MAX_ROW_LIMIT rows.
     """
+    print(f">>> TOOL CALLED: run_query | SQL: {query}", flush=True)
     safe_sql = validate_select(sql)
     limit = max(1, min(row_limit, MAX_ROW_LIMIT))
 
