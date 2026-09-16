@@ -12,7 +12,8 @@ Tools exposed:
   - run_query(sql, row_limit)     -> run a read-only SELECT and get rows back
 
 Security model:
-  - Every HTTP request must carry `Authorization: Bearer <AUTH_TOKEN>`.
+  - MCP requests require the static AUTH_TOKEN or a verified OAuth access token.
+  - Optional public OAuth discovery metadata enables ChatGPT account linking.
   - Only SELECT statements are allowed; anything else (INSERT, UPDATE,
     DELETE, DDL, multiple statements, etc.) is rejected before it
     reaches the database.
@@ -32,15 +33,19 @@ import hmac
 import os
 import re
 import sys
+from urllib.parse import urlsplit
 
+import jwt
 import pymysql
 import pymysql.cursors
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
 
 # ---------------------------------------------------------------------------
 # Configuration (all via environment variables -- see .env.example)
@@ -54,6 +59,30 @@ MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE")
 MYSQL_SSL = os.environ.get("MYSQL_SSL", "true").lower() in ("1", "true", "yes")
 
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+
+
+def oauth_configuration():
+    """OAuth is opt-in; partial or unsafe configuration fails at startup."""
+    names = ("OAUTH_ISSUER", "OAUTH_JWKS_URL", "OAUTH_RESOURCE_URL")
+    values = {name: os.environ.get(name, "") for name in names}
+    if not any(values.values()) and not os.environ.get("OAUTH_REQUIRED_SCOPES"):
+        return None
+    for name, value in values.items():
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment
+                or any(c.isspace() or c in '\\"' for c in value)):
+            raise ValueError(f"{name} must be a complete HTTPS URL without credentials, query, or fragment")
+    scopes = os.environ.get("OAUTH_REQUIRED_SCOPES", "mysql:read").split()
+    if not scopes or any(any(ord(c) < 33 or ord(c) > 126 or c in '\\"' for c in scope) for scope in scopes):
+        raise ValueError("OAUTH_REQUIRED_SCOPES must contain valid OAuth scope names")
+    return {**values, "scopes": scopes}
+
+
+OAUTH = oauth_configuration()
+# Fetch only the operator-configured JWKS URL, never a URL supplied by a token.
+# PyJWKClient caches the key set and refreshes it for key rotation.
+jwks_client = jwt.PyJWKClient(OAUTH["OAUTH_JWKS_URL"], timeout=5) if OAUTH else None
 
 DEFAULT_ROW_LIMIT = 200
 MAX_ROW_LIMIT = 2000
@@ -190,19 +219,84 @@ def run_query(sql: str, row_limit: int = DEFAULT_ROW_LIMIT) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Bearer-token auth middleware
+# Static Bearer and OAuth resource-server authentication
 # ---------------------------------------------------------------------------
+
+
+def verify_oauth_token(token: str) -> dict:
+    """Verify an RS256 access token issued specifically for this MCP resource."""
+    header = jwt.get_unverified_header(token)
+    if header.get("alg") != "RS256":
+        raise jwt.InvalidAlgorithmError("Only RS256 access tokens are supported")
+    key = jwks_client.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token, key.key, algorithms=["RS256"],
+        issuer=OAUTH["OAUTH_ISSUER"], audience=OAUTH["OAUTH_RESOURCE_URL"],
+        options={"require": ["iss", "aud", "exp", "sub"]},
+    )
+
+
+async def oauth_metadata(request: Request):
+    return JSONResponse({
+        "resource": OAUTH["OAUTH_RESOURCE_URL"],
+        "authorization_servers": [OAUTH["OAUTH_ISSUER"]],
+        "scopes_supported": OAUTH["scopes"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
+def auth_error(status_code=401, error=None):
+    challenge = "Bearer"
+    if OAUTH:
+        resource = urlsplit(OAUTH["OAUTH_RESOURCE_URL"])
+        metadata_url = f"{resource.scheme}://{resource.netloc}/.well-known/oauth-protected-resource"
+        challenge += f' resource_metadata="{metadata_url}", scope="{" ".join(OAUTH["scopes"])}"'
+        if error:
+            challenge += f', error="{error}"'
+    return PlainTextResponse(
+        "Forbidden" if status_code == 403 else "Unauthorized",
+        status_code=status_code, headers={"WWW-Authenticate": challenge},
+    )
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        expected = f"Bearer {AUTH_TOKEN}"
-        supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, expected):
-            return PlainTextResponse("Unauthorized", status_code=401)
+        # Only the exact discovery endpoints are public, and only for GET/HEAD.
+        if OAUTH and request.url.path in metadata_paths and request.method in ("GET", "HEAD"):
+            return await call_next(request)
+        headers = request.headers.getlist("authorization")
+        if len(headers) != 1:
+            return auth_error()
+        scheme, separator, token = headers[0].partition(" ")
+        if not separator or scheme.lower() != "bearer" or not token or any(c.isspace() for c in token):
+            return auth_error(error="invalid_token")
+        if hmac.compare_digest(token.encode(), AUTH_TOKEN.encode()):
+            return await call_next(request)
+        if not OAUTH:
+            return auth_error()
+        try:
+            # JWKS fetching is synchronous; keep network I/O off the event loop.
+            claims = await run_in_threadpool(verify_oauth_token, token)
+        except jwt.PyJWKClientConnectionError:
+            return PlainTextResponse("OAuth key service unavailable", status_code=503,
+                                     headers={"Retry-After": "5"})
+        except (jwt.PyJWTError, ValueError, TypeError):
+            return auth_error(error="invalid_token")
+        scope = claims.get("scope", "")
+        if not isinstance(scope, str) or not set(OAUTH["scopes"]).issubset(scope.split()):
+            return auth_error(status_code=403, error="insufficient_scope")
         return await call_next(request)
 
 
 app = mcp.streamable_http_app()
+metadata_paths = set()
+if OAUTH:
+    metadata_paths = {
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource" + urlsplit(OAUTH["OAUTH_RESOURCE_URL"]).path.rstrip("/"),
+    }
+    for path in sorted(metadata_paths):
+        app.routes.append(Route(path, oauth_metadata, methods=["GET", "HEAD"]))
 app.add_middleware(BearerAuthMiddleware)
 
 
